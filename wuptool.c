@@ -498,27 +498,26 @@ int main_utf8(int argc, char** argv)
     const char* pattern[] = { "%s%c%08x.app", "%s%c%08X.app", "%s%c%08x", "%s%c%08X" };
 
     if (argc < 2) {
-        printf("%s %s - Wii U NUS content file decrypter/packer\n"
+        printf("%s %s - Wii U NUS content tool\n"
             "Copyright (c) 2020-2023 VitaSmith, Copyright (c) 2013-2015 crediar\n"
             "Visit https://github.com/VitaSmith/cdecrypt for official source and downloads.\n\n"
             "Usage:\n"
-            "  %s <input_dir> [output_dir]  - Decrypt NUS content\n"
-            "  %s pack <input_dir> <output_dir> [common_key] - Pack extracted content\n"
-            "  %s pack <input_dir> <output_dir> - Pack using Wii U common key\n\n"
+            "  %s unpack <nus_dir> [output_dir]  - Decrypt/unpack NUS content\n"
+            "  %s pack <input_dir> <output_dir> -k <title_key> [-c <common_key>]\n\n"
+            "Pack options:\n"
+            "  -k <title_key>    Title key (32 hex chars, required)\n"
+            "  -c <common_key>   Common key (32 hex chars, default: Wii U common key)\n\n"
             "This program is free software; you can redistribute it and/or modify it under\n"
             "the terms of the GNU General Public License as published by the Free Software\n"
             "Foundation; either version 3 of the License or any later version.\n",
-            _appname(argv[0]), APP_VERSION_STR, _appname(argv[0]), _appname(argv[0]), _appname(argv[0]));
+            _appname(argv[0]), APP_VERSION_STR, _appname(argv[0]), _appname(argv[0]));
         return EXIT_SUCCESS;
     }
 
     // Check for pack subcommand
     if (strcmp(argv[1], "pack") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Usage: %s pack <input_dir> <output_dir> [options]\n", _appname(argv[0]));
-            fprintf(stderr, "Options:\n");
-            fprintf(stderr, "  -k <title_key>    Title key (32 hex chars, required for encryption)\n");
-            fprintf(stderr, "  -c <common_key>   Common key to encrypt title key (32 hex chars, default: Wii U common key)\n");
+            fprintf(stderr, "Usage: %s pack <input_dir> <output_dir> -k <title_key> [-c <common_key>]\n", _appname(argv[0]));
             return EXIT_FAILURE;
         }
         const char* title_key = NULL;
@@ -533,8 +532,33 @@ int main_utf8(int argc, char** argv)
             }
         }
         
+        if (title_key == NULL) {
+            fprintf(stderr, "ERROR: Title key (-k) is required for packing\n");
+            return EXIT_FAILURE;
+        }
+        
         extern int pack_title(const char* input_dir, const char* output_dir, const char* title_key, const char* common_key);
         return pack_title(argv[2], argv[3], title_key, common_key);
+    }
+    
+    // Check for unpack subcommand
+    if (strcmp(argv[1], "unpack") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s unpack <nus_dir> [output_dir]\n", _appname(argv[0]));
+            return EXIT_FAILURE;
+        }
+        // Shift argv to reuse existing unpack logic
+        for (int i = 1; i < argc - 1; i++) {
+            argv[i] = argv[i + 1];
+        }
+        argc--;
+    } else {
+        // Unknown subcommand - show help
+        fprintf(stderr, "Unknown command: %s\n\n", argv[1]);
+        fprintf(stderr, "Usage:\n");
+        fprintf(stderr, "  %s unpack <nus_dir> [output_dir]  - Decrypt/unpack NUS content\n", _appname(argv[0]));
+        fprintf(stderr, "  %s pack <input_dir> <output_dir> -k <title_key> [-c <common_key>]\n", _appname(argv[0]));
+        return EXIT_FAILURE;
     }
 
     if (!is_directory(argv[1])) {
