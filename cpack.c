@@ -1132,7 +1132,180 @@ int pack_title(const char* input_dir, const char* output_dir, const char* title_
         if (cur_offset > 0) {
             info.contents[i].size = (uint32_t)cur_offset;
         }
-    };
+    }
+    
+    // Scan for new files not in metadata
+    printf("Scanning for new files...\n");
+    
+    // First, recursively scan directory for all files
+    // Disable format-truncation warning as we use sufficiently large buffers
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+    char scan_path[4096];
+    
+    // Use a simple stack-based directory traversal
+    typedef struct {
+        char path[4096];
+    } dir_stack_entry;
+    
+    dir_stack_entry* dir_stack = malloc(100 * sizeof(dir_stack_entry));
+    int stack_top = 0;
+    strcpy(dir_stack[stack_top++].path, ".");
+    
+    while (stack_top > 0) {
+        char current_rel[4096];
+        strcpy(current_rel, dir_stack[--stack_top].path);
+        
+        snprintf(scan_path, sizeof(scan_path), "%s%s%s", input_dir, PATH_SEP_STR, current_rel);
+        
+        DIR* dir = opendir(scan_path);
+        if (!dir) continue;
+        
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            if (strcmp(entry->d_name, ".title_meta.json") == 0) continue;
+            
+            char entry_rel_path[4096];
+            if (strcmp(current_rel, ".") == 0) {
+                snprintf(entry_rel_path, sizeof(entry_rel_path), "%s", entry->d_name);
+            } else {
+                snprintf(entry_rel_path, sizeof(entry_rel_path), "%s%s%s", 
+                         current_rel, PATH_SEP_STR, entry->d_name);
+            }
+            
+            char entry_full_path[4096];
+            snprintf(entry_full_path, sizeof(entry_full_path), "%s%s%s", 
+                     input_dir, PATH_SEP_STR, entry_rel_path);
+            
+            struct stat st;
+            if (stat(entry_full_path, &st) != 0) continue;
+            
+            if (S_ISDIR(st.st_mode)) {
+                // Add to stack for recursion
+                if (stack_top < 100) {
+                    strcpy(dir_stack[stack_top++].path, entry_rel_path);
+                }
+            } else if (S_ISREG(st.st_mode)) {
+                // Check if file is already in entries
+                bool found = false;
+                for (uint32_t i = 0; i < info.entry_count; i++) {
+                    if (info.entries[i].path && strcmp(info.entries[i].path, entry_rel_path) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                
+                if (!found) {
+                    // New file found
+                    printf("  New file: %s (%ld bytes)\n", entry_rel_path, st.st_size);
+                    
+                    // Find content for this file based on extension first, then directory
+                    uint16_t content_id = 0xFFFF;
+                    
+                    // Get file extension
+                    char* ext = strrchr(entry->d_name, '.');
+                    if (ext) ext++;  // Skip the dot
+                    
+                    // First, try to find a file with same extension in same or similar directory
+                    for (uint32_t i = 0; i < info.entry_count; i++) {
+                        if (info.entries[i].is_dir || !info.entries[i].path) continue;
+                        
+                        char* entry_ext = strrchr(info.entries[i].name, '.');
+                        if (entry_ext) entry_ext++;
+                        
+                        // Match by extension first (e.g., .jpg files go together)
+                        if (ext && entry_ext && strcasecmp(ext, entry_ext) == 0) {
+                            content_id = info.entries[i].content_id;
+                            printf("    -> Matched by extension .%s\n", ext);
+                            break;
+                        }
+                    }
+                    
+                    // If no extension match, try directory match
+                    if (content_id == 0xFFFF) {
+                        char* last_slash = strrchr(entry_rel_path, '/');
+                        char dir_path[256] = "";
+                        
+                        if (last_slash) {
+                            strncpy(dir_path, entry_rel_path, last_slash - entry_rel_path);
+                            dir_path[last_slash - entry_rel_path] = '\0';
+                        }
+                        
+                        // Find a file in the same directory
+                        for (uint32_t i = 0; i < info.entry_count; i++) {
+                            if (info.entries[i].is_dir || !info.entries[i].path) continue;
+                            char* entry_last_slash = strrchr(info.entries[i].path, '/');
+                            if (entry_last_slash) {
+                                char entry_dir[256];
+                                strncpy(entry_dir, info.entries[i].path, entry_last_slash - info.entries[i].path);
+                                entry_dir[entry_last_slash - info.entries[i].path] = '\0';
+                                if (strcmp(entry_dir, dir_path) == 0) {
+                                    content_id = info.entries[i].content_id;
+                                    printf("    -> Matched by directory %s\n", dir_path);
+                                    break;
+                                }
+                            } else if (dir_path[0] == '\0') {
+                                // Root directory
+                                content_id = info.entries[i].content_id;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (content_id != 0xFFFF) {
+                        // Add new entry
+                        uint32_t new_idx = info.entry_count;
+                        info.entries = realloc(info.entries, (new_idx + 1) * sizeof(pack_fst_entry));
+                        memset(&info.entries[new_idx], 0, sizeof(pack_fst_entry));
+                        info.entries[new_idx].path = strdup(entry_rel_path);
+                        info.entries[new_idx].name = strdup(entry->d_name);
+                        info.entries[new_idx].file_size = (uint32_t)st.st_size;
+                        info.entries[new_idx].content_id = content_id;
+                        info.entries[new_idx].is_dir = false;
+                        info.entries[new_idx].file_offset = 0;
+                        
+                        // Copy flags from sibling files in same content
+                        for (uint32_t i = 0; i < new_idx; i++) {
+                            if (info.entries[i].content_id == content_id) {
+                                info.entries[new_idx].flags = info.entries[i].flags;
+                                break;
+                            }
+                        }
+                        
+                        info.entry_count++;
+                        printf("    -> Assigned to content %04X\n", content_id);
+                    } else {
+                        printf("    -> Warning: Could not determine content for this file, skipping\n");
+                    }
+                }
+            }
+        }
+        closedir(dir);
+    }
+    free(dir_stack);
+    
+    // Recalculate offsets after adding new files
+    printf("Recalculating offsets...\n");
+    for (uint32_t i = 0; i < info.content_count; i++) {
+        uint64_t cur_offset = 0;
+        
+        for (uint32_t j = 0; j < info.entry_count; j++) {
+            pack_fst_entry* entry = &info.entries[j];
+            
+            if (entry->content_id != info.contents[i].id || entry->is_dir) continue;
+            
+            entry->file_offset = (uint32_t)cur_offset;
+            cur_offset += (entry->file_size + 0x1F) & ~0x1F;
+        }
+        
+        if (cur_offset > 0) {
+            info.contents[i].size = (uint32_t)cur_offset;
+        }
+    }
+    
+    // Update root entry's next_idx to reflect total entry count
+    info.entries[0].next_idx = info.entry_count;
     
     // Title key is required for encryption
     uint8_t title_key[16];
