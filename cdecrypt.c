@@ -520,6 +520,20 @@ int main_utf8(int argc, char** argv)
         if (fe[i].Type & 1) {
             entry[level] = i;
             l_entry[level++] = getbe32(&fe[i].NextOffset);
+			// build directory path immediately
+			char dirpath[PATH_MAX];
+			memset(dirpath, 0, sizeof(dirpath));
+			strcpy(dirpath, dst_dir);
+			
+			for (uint32_t j = 0; j < level; j++) {
+				char sep[2] = { PATH_SEP, '\0' };
+				strcat(dirpath, sep);
+			
+				uint32_t off = getbe32(&fe[entry[j]].TypeName) & 0x00FFFFFF;
+				strcat(dirpath, (char*)(cnt + name_offset + off));
+			}
+			
+			create_path(dirpath);
             if (level >= MAX_LEVELS) {
                 fprintf(stderr, "ERROR: Too many levels\n");
                 break;
