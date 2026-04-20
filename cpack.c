@@ -20,6 +20,7 @@
 #include "util.h"
 #include "utf8.h"
 #include "aes.h"
+#include "md5.h"
 
 #pragma pack(1)
 
@@ -78,54 +79,9 @@ static const uint8_t WiiUCommonDevKey[16] = {
 #define PACK_BLOCK_SIZE 0x8000
 
 // ---------------------------------------------------------------------------
-// Copy a file verbatim — used to carry .tmd, .tik, .cert into output_dir
-// ---------------------------------------------------------------------------
-static bool pack_copy_file(const char* src_path, const char* dst_path)
-{
-    bool r = false;
-    FILE* src = NULL;
-    FILE* dst = NULL;
-    uint8_t* buf = malloc(PACK_BLOCK_SIZE);
-
-    if (buf == NULL) {
-        fprintf(stderr, "ERROR: Out of memory\n");
-        goto out;
-    }
-    src = fopen_utf8(src_path, "rb");
-    if (src == NULL) {
-        fprintf(stderr, "ERROR: Could not open '%s'\n", src_path);
-        goto out;
-    }
-    dst = fopen_utf8(dst_path, "wb");
-    if (dst == NULL) {
-        fprintf(stderr, "ERROR: Could not create '%s'\n", dst_path);
-        goto out;
-    }
-    for (;;) {
-        size_t n = fread(buf, 1, PACK_BLOCK_SIZE, src);
-        if (n == 0) break;
-        if (fwrite(buf, 1, n, dst) != n) {
-            fprintf(stderr, "ERROR: Write failed to '%s'\n", dst_path);
-            goto out;
-        }
-    }
-    r = true;
-out:
-    if (src != NULL) fclose(src);
-    if (dst != NULL) fclose(dst);
-    free(buf);
-    return r;
-}
-
-// ---------------------------------------------------------------------------
-// Re-encrypt one .app.dec file back to a .app file.
-//
-// This is the exact inverse of decrypt_app_raw in wuptool.c:
-//   - Same block size (0x8000)
-//   - Same IV scheme: zeroed, content_index in byte [1]
-//   - Always write full 0x8000-byte blocks, zero-padding the last one.
-//     The original .app files were always block-aligned, so this produces
-//     byte-identical output to the original encrypted content.
+// Re-encrypt one .app.dec back to a .app file.
+// Exact inverse of decrypt_app_raw in wuptool.c — same IV, same block size,
+// always writes full 0x8000-byte blocks (zero-padding the last one).
 // ---------------------------------------------------------------------------
 static __attribute__((noinline)) bool encrypt_app_raw(
     const char* src_path, const char* dst_path,
@@ -157,35 +113,21 @@ static __attribute__((noinline)) bool encrypt_app_raw(
         goto out;
     }
 
-    // Local encryption context — does not touch the global ctx in wuptool.c
     aes_setkey_enc(&enc_ctx, title_key, 128);
-
-    // IV matches what decrypt_app_raw uses: all zeroes, content_index in byte [1]
     memset(iv, 0, sizeof(iv));
     iv[1] = (uint8_t)content_index;
 
     remaining = data_size;
     while (remaining > 0) {
         size_t to_read = (remaining < PACK_BLOCK_SIZE) ? (size_t)remaining : PACK_BLOCK_SIZE;
-
-        // Zero-fill so the final partial block is padded identically to the
-        // original (Nintendo's tooling zero-pads before encrypting too)
         memset(plain, 0, PACK_BLOCK_SIZE);
-
         size_t bytes_read = fread(plain, 1, to_read, src);
-        if (bytes_read == 0)
-            break;
-
-        // Always encrypt a full block — .app files are always block-aligned
-        // CBC chaining is handled automatically: aes_crypt_cbc updates iv to
-        // the last ciphertext block, so the next iteration uses the right IV
+        if (bytes_read == 0) break;
         aes_crypt_cbc(&enc_ctx, AES_ENCRYPT, PACK_BLOCK_SIZE, iv, plain, cipher);
-
         if (fwrite(cipher, 1, PACK_BLOCK_SIZE, dst) != PACK_BLOCK_SIZE) {
             fprintf(stderr, "ERROR: Write failed to '%s'\n", dst_path);
             goto out;
         }
-
         remaining -= bytes_read;
     }
 
@@ -201,14 +143,16 @@ out:
 #undef PACK_BLOCK_SIZE
 
 // ---------------------------------------------------------------------------
-// pack_title — re-encrypt all .app.dec files back to .app
+// pack_title — re-encrypt all .app.dec files back to .app, verify, clean up.
 //
-// The title key is derived from the .tik file the same way unpack does:
-//   common_key (from TMD issuer) → AES-CBC decrypt tik[0x1BF] with title_id IV
-//
-// title.tmd, title.tik, and title.cert are copied verbatim — no regeneration.
+// For each content:
+//   1. Re-encrypt <dir>/<id>.app.dec  →  <dir>/<id>.app
+//   2. Compute MD5 of the new .app
+//   3. Compare against <dir>/<id>.app.md5
+//   4. Match   → delete .app.dec and .app.md5  (recovery complete)
+//   5. No match → warn, delete the bad .app (leave .app.dec + .app.md5 intact)
 // ---------------------------------------------------------------------------
-int pack_title(const char* input_dir, const char* output_dir)
+int pack_title(const char* dir)
 {
     int r = -1;
     char str[PATH_MAX];
@@ -217,6 +161,7 @@ int pack_title(const char* input_dir, const char* output_dir)
     uint8_t title_id[16];
     uint8_t title_key[16];
     aes_context ctx;
+    uint32_t ok_count = 0, fail_count = 0;
 
     const char* dec_patterns[] = {
         "%s%c%08x.app.dec",
@@ -224,89 +169,58 @@ int pack_title(const char* input_dir, const char* output_dir)
     };
 
     // ---- Load TMD -------------------------------------------------------
-    snprintf(str, sizeof(str), "%s%ctitle.tmd", input_dir, PATH_SEP);
+    snprintf(str, sizeof(str), "%s%ctitle.tmd", dir, PATH_SEP);
     uint32_t tmd_len = read_file(str, (uint8_t**)&tmd);
     if (tmd_len == 0) {
-        fprintf(stderr, "ERROR: Could not read title.tmd from '%s'\n", input_dir);
+        fprintf(stderr, "ERROR: Could not read title.tmd from '%s'\n", dir);
         goto out;
     }
-
     if (tmd->Version != 1) {
         fprintf(stderr, "ERROR: Unsupported TMD version: %u\n", tmd->Version);
         goto out;
     }
 
     // ---- Load TIK -------------------------------------------------------
-    snprintf(str, sizeof(str), "%s%ctitle.tik", input_dir, PATH_SEP);
+    snprintf(str, sizeof(str), "%s%ctitle.tik", dir, PATH_SEP);
     uint32_t tik_len = read_file(str, &tik);
     if (tik_len == 0) {
-        fprintf(stderr, "ERROR: Could not read title.tik from '%s'\n", input_dir);
+        fprintf(stderr, "ERROR: Could not read title.tik from '%s'\n", dir);
         goto out;
     }
 
     printf("Title ID      : %016" PRIX64 "\n", getbe64(&tmd->TitleID));
-    printf("Title version : %u\n",  getbe16(&tmd->TitleVersion));
-    printf("Content count : %u\n",  getbe16(&tmd->ContentCount));
+    printf("Title version : %u\n", getbe16(&tmd->TitleVersion));
+    printf("Content count : %u\n", getbe16(&tmd->ContentCount));
 
-    // ---- Derive title key (mirrors unpack exactly) ----------------------
-    // Step 1: select common key from issuer field
-    if (strcmp((char*)tmd->Issuer, "Root-CA00000003-CP0000000b") == 0) {
+    // ---- Derive title key -----------------------------------------------
+    if (strcmp((char*)tmd->Issuer, "Root-CA00000003-CP0000000b") == 0)
         aes_setkey_dec(&ctx, WiiUCommonKey, 128);
-    } else if (strcmp((char*)tmd->Issuer, "Root-CA00000004-CP00000010") == 0) {
+    else if (strcmp((char*)tmd->Issuer, "Root-CA00000004-CP00000010") == 0)
         aes_setkey_dec(&ctx, WiiUCommonDevKey, 128);
-    } else {
+    else {
         fprintf(stderr, "ERROR: Unknown issuer: '%s'\n", (char*)tmd->Issuer);
         goto out;
     }
 
-    // Step 2: title_id (big-endian, zero-padded to 16 bytes) is the IV
     memset(title_id, 0, sizeof(title_id));
     memcpy(title_id, &tmd->TitleID, 8);
-
-    // Step 3: decrypt the encrypted title key stored at tik[0x1BF]
     memcpy(title_key, tik + 0x1BF, 16);
     aes_crypt_cbc(&ctx, AES_DECRYPT, 16, title_id, title_key, title_key);
 
-    printf("Title key derived from ticket.\n");
+    printf("Title key derived from ticket.\n\n");
 
-    // ---- Prepare output directory ----------------------------------------
-    create_path((char*)output_dir);
-
-    // ---- Copy metadata files verbatim -----------------------------------
-    // title.tmd
-    snprintf(str, sizeof(str), "%s%ctitle.tmd", input_dir, PATH_SEP);
-    char dst_meta[PATH_MAX];
-    snprintf(dst_meta, sizeof(dst_meta), "%s%ctitle.tmd", output_dir, PATH_SEP);
-    if (!pack_copy_file(str, dst_meta))
-        goto out;
-
-    // title.tik
-    snprintf(str, sizeof(str), "%s%ctitle.tik", input_dir, PATH_SEP);
-    snprintf(dst_meta, sizeof(dst_meta), "%s%ctitle.tik", output_dir, PATH_SEP);
-    if (!pack_copy_file(str, dst_meta))
-        goto out;
-
-    // title.cert (optional — present in most NUS packages)
-    snprintf(str, sizeof(str), "%s%ctitle.cert", input_dir, PATH_SEP);
-    if (is_file(str)) {
-        snprintf(dst_meta, sizeof(dst_meta), "%s%ctitle.cert", output_dir, PATH_SEP);
-        if (!pack_copy_file(str, dst_meta))
-            goto out;
-    }
-
-    // ---- Re-encrypt each content ----------------------------------------
+    // ---- Re-encrypt and verify each content -----------------------------
     uint16_t content_count = getbe16(&tmd->ContentCount);
     for (uint16_t i = 0; i < content_count; i++) {
         uint32_t content_file_id = getbe32(&tmd->Contents[i].ID);
         uint64_t content_size    = getbe64(&tmd->Contents[i].Size);
         uint16_t content_index   = getbe16(&tmd->Contents[i].Index);
 
-        // Find the .app.dec source (handle upper/lowercase)
+        // Find the .app.dec source
         str[0] = '\0';
         for (uint32_t k = 0; k < 2; k++) {
-            snprintf(str, sizeof(str), dec_patterns[k], input_dir, PATH_SEP, content_file_id);
-            if (is_file(str))
-                break;
+            snprintf(str, sizeof(str), dec_patterns[k], dir, PATH_SEP, content_file_id);
+            if (is_file(str)) break;
         }
         if (!is_file(str)) {
             fprintf(stderr, "WARNING: Could not find .app.dec for content %08X, skipping\n",
@@ -314,23 +228,79 @@ int pack_title(const char* input_dir, const char* output_dir)
             continue;
         }
 
-        // Destination: <output_dir>/<id>.app
-        char dst_path[PATH_MAX];
-        snprintf(dst_path, sizeof(dst_path), "%s%c%08X.app",
-                 output_dir, PATH_SEP, content_file_id);
+        char dec_path[PATH_MAX], app_path[PATH_MAX], md5_path[PATH_MAX];
+        snprintf(dec_path, sizeof(dec_path), "%s", str);
+        snprintf(app_path, sizeof(app_path), "%s%c%08x.app",     dir, PATH_SEP, content_file_id);
+        snprintf(md5_path, sizeof(md5_path), "%s%c%08x.app.md5", dir, PATH_SEP, content_file_id);
 
-        printf("[%3u/%3u] %08X  size: %10" PRIu64 "  index: %u  -> %s\n",
-               i + 1, content_count, content_file_id, content_size,
-               content_index, dst_path);
+        printf("[%3u/%3u] %08X  size: %10" PRIu64 "  index: %u\n",
+               i + 1, content_count, content_file_id, content_size, content_index);
 
-        if (!encrypt_app_raw(str, dst_path, content_index, content_size, title_key)) {
-            fprintf(stderr, "ERROR: Failed to encrypt content %08X\n", content_file_id);
-            goto out;
+        // Step 1: re-encrypt .app.dec → .app
+        if (!encrypt_app_raw(dec_path, app_path, content_index, content_size, title_key)) {
+            fprintf(stderr, "  ERROR: Encryption failed for content %08X\n", content_file_id);
+            remove(app_path);
+            fail_count++;
+            continue;
         }
+
+        // Step 2: compute MD5 of the new .app
+        uint8_t digest_new[16];
+        FILE* f = fopen_utf8(app_path, "rb");
+        if (f == NULL || !md5_of_file(f, digest_new)) {
+            if (f) fclose(f);
+            fprintf(stderr, "  ERROR: Could not compute MD5 for '%s'\n", app_path);
+            remove(app_path);
+            fail_count++;
+            continue;
+        }
+        fclose(f);
+
+        // Step 3: read stored .app.md5
+        uint8_t digest_stored[16];
+        FILE* mf = fopen_utf8(md5_path, "rb");
+        if (mf == NULL) {
+            fprintf(stderr, "  ERROR: Could not read MD5 file '%s'\n", md5_path);
+            remove(app_path);
+            fail_count++;
+            continue;
+        }
+        bool md5_read_ok = (fread(digest_stored, 1, 16, mf) == 16);
+        fclose(mf);
+
+        if (!md5_read_ok) {
+            fprintf(stderr, "  ERROR: Could not read MD5 file '%s'\n", md5_path);
+            remove(app_path);
+            fail_count++;
+            continue;
+        }
+
+        // Step 4: compare
+        if (memcmp(digest_new, digest_stored, 16) != 0) {
+            char hex_new[33], hex_stored[33];
+            md5_to_hex(digest_new, hex_new);
+            md5_to_hex(digest_stored, hex_stored);
+            fprintf(stderr, "  WARNING: MD5 mismatch for content %08X\n", content_file_id);
+            fprintf(stderr, "    expected : %s\n", hex_stored);
+            fprintf(stderr, "    got      : %s\n", hex_new);
+            fprintf(stderr, "    Keeping .app.dec and .app.md5 intact.\n");
+            remove(app_path);
+            fail_count++;
+            continue;
+        }
+
+        char hex_new[33];
+        md5_to_hex(digest_new, hex_new);
+        printf("  OK  MD5: %s\n", hex_new);
+
+        // Step 5: verified — clean up .app.dec and .app.md5
+        remove(dec_path);
+        remove(md5_path);
+        ok_count++;
     }
 
-    printf("Done. %u content file(s) encrypted.\n", content_count);
-    r = 0;
+    printf("\nEncrypt complete: %u succeeded, %u failed.\n", ok_count, fail_count);
+    r = (fail_count == 0) ? 0 : -1;
 
 out:
     free(tmd);
